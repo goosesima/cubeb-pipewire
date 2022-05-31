@@ -27,6 +27,10 @@ struct cubeb_stream {
   void * user_ptr;
 };
 
+#if defined(USE_PIPEWIRE)
+int
+pipewire_init(cubeb ** context, char const * context_name);
+#endif
 #if defined(USE_PULSE)
 int
 pulse_init(cubeb ** context, char const * context_name);
@@ -148,7 +152,11 @@ cubeb_init(cubeb ** context, char const * context_name,
   int (*init_oneshot)(cubeb **, char const *) = NULL;
 
   if (backend_name != NULL) {
-    if (!strcmp(backend_name, "pulse")) {
+    if (!strcmp(backend_name, "pipewire")) {
+#if defined(USE_PIPEWIRE)
+      init_oneshot = pipewire_init;
+#endif
+    } else if (!strcmp(backend_name, "pulse")) {
 #if defined(USE_PULSE)
       init_oneshot = pulse_init;
 #endif
@@ -219,6 +227,9 @@ cubeb_init(cubeb ** context, char const * context_name,
      * to override all other choices
      */
     init_oneshot,
+#if defined(USE_PIPEWIRE)
+    pipewire_init,
+#endif
 #if defined(USE_PULSE_RUST)
     pulse_rust_init,
 #endif

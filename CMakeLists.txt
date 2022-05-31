@@ -155,25 +155,40 @@ target_link_libraries(cubeb PRIVATE $<BUILD_INTERFACE:speex>)
 
 include(CheckIncludeFiles)
 
-# Threads needed by cubeb_log, _pulse, _alsa, _jack, _sndio, _oss and _sun
+# Threads needed by cubeb_log, _pipewire, _pulse, _alsa, _jack, _sndio, _oss and _sun
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads)
 target_link_libraries(cubeb PRIVATE Threads::Threads)
 
 if(LAZY_LOAD_LIBS)
-  check_include_files(pulse/pulseaudio.h USE_PULSE)
-  check_include_files(alsa/asoundlib.h   USE_ALSA)
-  check_include_files(jack/jack.h        USE_JACK)
-  check_include_files(sndio.h            USE_SNDIO)
-  check_include_files(aaudio/AAudio.h    USE_AAUDIO)
+  # check_include_files(pipewire-0.3/pipewire/pipewire.h USE_PIPEWIRE)
+  # TODO
+  pkg_check_modules(libpipewire IMPORTED_TARGET libpipewire-0.3)
+  if(libpipewire_FOUND)
+    set(USE_PIPEWIRE OdN)
+    target_compile_definitions(cubeb PRIVATE DISABLE_LIBPIPEWIRE_DLOPEN)
+    target_link_libraries(cubeb PRIVATE PkgConfig::libpipewire)
+  endif()
+  check_include_files(pulse/pulseaudio.h  USE_PULSE)
+  check_include_files(alsa/asoundlib.h    USE_ALSA)
+  check_include_files(jack/jack.h         USE_JACK)
+  check_include_files(sndio.h             USE_SNDIO)
+  check_include_files(aaudio/AAudio.h     USE_AAUDIO)
 
-  if(USE_PULSE OR USE_ALSA OR USE_JACK OR USE_SNDIO OR USE_AAUDIO)
+  if(USE_PIPEWIRE OR USE_PULSE OR USE_ALSA OR USE_JACK OR USE_SNDIO OR USE_AAUDIO)
     target_link_libraries(cubeb PRIVATE ${CMAKE_DL_LIBS})
   endif()
 
 else()
 
   find_package(PkgConfig REQUIRED)
+  # TODO
+  # pkg_check_modules(libpipewire IMPORTED_TARGET libpipewire-0.3)
+  # if(libpipewire_FOUND)
+  #   set(USE_PIPEWIRE OdN)
+  #   target_compile_definitions(cubeb PRIVATE DISABLE_LIBPIPEWIRE_DLOPEN)
+  #   target_link_libraries(cubeb PRIVATE PkgConfig::libpipewire)
+  # endif()
 
   pkg_check_modules(libpulse IMPORTED_TARGET libpulse)
   if(libpulse_FOUND)
@@ -207,6 +222,11 @@ else()
     target_compile_definitions(cubeb PRIVATE DISABLE_LIBAAUDIO_DLOPEN)
     target_link_libraries(cubeb PRIVATE aaudio)
   endif()
+endif()
+
+if(USE_PIPEWIRE)
+  target_sources(cubeb PRIVATE src/cubeb_pipewire.c)
+  target_compile_definitions(cubeb PRIVATE USE_PIPEWIRE)
 endif()
 
 if(USE_PULSE)

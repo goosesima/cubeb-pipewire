@@ -1,3 +1,7 @@
+# Plays beep sound using PipeWire
+# TODO
+- cubeb_pipewire.c
+- PipeWire dependencies CMakeLists.txt
 [![Build Status](https://github.com/mozilla/cubeb/actions/workflows/build.yml/badge.svg)](https://github.com/mozilla/cubeb/actions/workflows/build.yml)
 
 See INSTALL.md for build instructions.
