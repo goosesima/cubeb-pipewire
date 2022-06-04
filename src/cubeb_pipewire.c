@@ -25,13 +25,18 @@ LIBPIPEWIRE_API_VISIT(MAKE_TYPEDEF);
 
 static struct cubeb_ops const pipewire_ops;
 
+struct pw_cubeb_default_sink_info {
+  uint32_t channels;
+  uint32_t sample_spec_rate;
+};
+
 struct cubeb {
   struct cubeb_ops const * ops;
   void * libpipewire;
   struct pw_core * core;
   struct pw_thread_loop * mainloop;
   struct pw_context * context;
-  struct cubeb_default_sink_info * default_sink_info;
+  struct pw_cubeb_default_sink_info * pw_cubeb_default_sink_info;
   char * context_name;
   int error;
   cubeb_device_collection_changed_callback output_collection_changed_callback;
@@ -39,7 +44,10 @@ struct cubeb {
   cubeb_device_collection_changed_callback input_collection_changed_callback;
   void * input_collection_changed_user_ptr;
   cubeb_strings * device_ids;
-  struct pw_properties * props;
+  struct pw_registry * registry;
+  struct spa_hook registry_listener;
+  cubeb_device_collection * collection;
+  uint32_t total_devices;
 };
 
 struct cubeb_stream {
@@ -50,6 +58,7 @@ struct cubeb_stream {
   struct spa_hook stream_listener;
   int shutdown;
   struct spa_audio_info_raw info;
+  struct pw_properties * props;
   // pw_stream * output_stream;
   // pw_stream * input_stream;
   // pthread_t thread;
@@ -65,8 +74,83 @@ struct cubeb_stream {
   float volume;
   cubeb_state state;
   enum spa_audio_format spa_format;
-
 };
+
+static void
+registry_event_global(void * userdata, uint32_t id, uint32_t permissions,
+                      const char * type, uint32_t version,
+                      const struct spa_dict * props)
+{
+  const char * class = spa_dict_lookup(props, PW_KEY_DEVICE_CLASS);
+  if (!class) {
+    return;
+  }
+  if (!(strcmp(class, "Audio/Source") == 0 ||
+        strcmp(class, "Audio/Sink") == 0)) {
+    return;
+  }
+  const char * name = spa_dict_lookup(props, PW_KEY_NODE_NAME);
+  const char * device_id = spa_dict_lookup(props, PW_KEY_DEVICE_ID);
+  const char * description = spa_dict_lookup(props, PW_KEY_NODE_DESCRIPTION);
+  const char * rate = spa_dict_lookup(props, PW_KEY_AUDIO_RATE);
+  const char * channels = spa_dict_lookup(props, PW_KEY_AUDIO_CHANNELS);
+  // const char *id = spa_dict_lookup(props, PW_KEY_MEDIA_ID);
+  printf("Found audio source: %s (%s)\n", name, description);
+  // if () {
+  //   printf("Found audio sink: %s (%s)\n", name, description);
+  //   printf("class: %s\n", class);
+  //   // printf("id: %s\n", id);
+  // }
+  // if(id == PW_ID_ANY){
+  //         // printf("Found def: %s (%s)\n", name, description);
+  //         // printf("class: %s\n", class);
+  //         // printf("id: %s\n", id);
+  // // }
+  // printf("id: %d\n", id);
+  // printf("PW_ID_ANY: %d\n", PW_ID_ANY);
+
+  // get default device
+  // PW_ID_ANY
+  // {
+  //         return;
+  // }
+  // if (name)
+  // {
+  //         printf("\tname: %s\n", name);
+  //         printf("\tgroup: %s\n", description);
+  //         printf("\tclass: %s\n", class);
+  // }
+  // if (strcmp(type, "Device") == 0) {
+  // }
+
+  cubeb_device_info * device;
+  device->device_id = device_id;
+  device->friendly_name = name;
+  device->group_id = name;
+  device->type = strcmp(class, "Audio/Source") == 0 ? CUBEB_DEVICE_TYPE_INPUT
+                                                    : CUBEB_DEVICE_TYPE_OUTPUT;
+  device->state = CUBEB_DEVICE_STATE_ENABLED;
+  device->preferred = false;
+  // device.format = SPA_AUDIO_FORMAT_S16;
+  // device.default_format = SPA_AUDIO_FORMAT_S16;
+  device->max_channels = atoi(channels);
+  device->default_rate = atoi(rate);
+  device->max_rate = atoi(rate);
+  device->min_rate = atoi(rate);
+  device->latency_lo = 0;
+  device->latency_hi = 0;
+  struct cubeb_stream * stm = userdata;
+  struct cubeb * ctx = stm->context;
+  ctx->total_devices--;
+}
+
+pipewire_enumerate_devices(cubeb * ctx, cubeb_device_type type,
+                           cubeb_device_collection * collection)
+{
+  // collection->device = user_data.devinfo;
+  collection->count = ctx->total_devices;
+  return CUBEB_OK;
+}
 
 static void
 on_process(void * userdata)
@@ -82,7 +166,7 @@ on_process(void * userdata)
   struct spa_buffer * buf;
   int i, c, n_frames;
   size_t nbytes;
-  void * input_data;
+  void const * input_data;
   // void * output_data;
   struct spa_data * d;
   b = pw_stream_dequeue_buffer(stm->stream);
@@ -109,17 +193,20 @@ on_process(void * userdata)
   got = stm->data_callback(stm, stm->user_ptr,
                            (uint8_t const *)input_data + read_offset,
                            buf->datas[0].data, n_frames);
+
+  // if (input_data) {
+  //   read_offset += (size / frame_size) * stm->stride;
+  // }
+  int sizebuf = n_frames * num_channels;
   if (stm->spa_format == SPA_AUDIO_FORMAT_S16) {
     short * dst = buf->datas[0].data;
-    for (i = 0; i < n_frames; i++) {
-      for (c = 0; c < num_channels; c++)
-        dst[i * num_channels + c] *= stm->volume;
+    for (i = 0; i < sizebuf; i++) {
+      dst[i] *= stm->volume;
     }
   } else {
     float * dst = buf->datas[0].data;
-    for (i = 0; i < n_frames; i++) {
-      for (c = 0; c < num_channels; c++)
-        dst[i * num_channels + c] *= stm->volume;
+    for (i = 0; i < sizebuf; i++) {
+      dst[i] *= stm->volume;
     }
   }
   if (got < 0) {
@@ -146,21 +233,25 @@ on_param_changed(void * userdata, uint32_t id, const struct spa_pod * param)
 {
   printf("on_param_changed\n");
 
+  struct cubeb_stream * stm = userdata;
+  // cubeb * ctx = stm->context;
 
-  // struct cubeb_stream * stm = userdata;
   // return;
-  // if (param == NULL || id != SPA_PARAM_Format)
-  //   return;
+  if (param == NULL || id != SPA_PARAM_Format)
+    return;
 
-  // // if (spa_format_parse(param, &stm->info.media_type, &stm->info.media_subtype) <
-  // //     0)
-  // //   return;
+  // set stm->channels
+  // struct spa_audio_info_raw audio_info;
+  // spa_audio_info_raw_parse(&audio_info, param);
+  // stm->info.channels = audio_info.channels;
+  // if (spa_format_parse(param, &stm->info.media_type,
+  // &stm->info.media_subtype) <
+  //     0)
+  //   return;
 
   // const struct spa_pod * params[1];
   // uint8_t buffer[1024];
   // struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
-
-  // cubeb * ctx = stm->context;
 
   // // int buffer_size = stm->info.rate * stm->info.channels * sizeof(int16_t);
   // int buffer_size = 20;
@@ -174,19 +265,43 @@ on_param_changed(void * userdata, uint32_t id, const struct spa_pod * param)
 }
 
 static void
-on_state_changed(void * userdata, enum pw_stream_state old_state, enum pw_stream_state new_state)
+on_state_changed(void * userdata, enum pw_stream_state old_state,
+                 enum pw_stream_state new_state)
 {
   printf("on_state_changed\n");
   if (new_state == PW_STREAM_STATE_ERROR) {
-    }
+  }
 }
 
 static const struct pw_stream_events stream_events = {
-    PW_VERSION_STREAM_EVENTS, .process = on_process,
-    .control_info = on_control_info,
-    .param_changed = on_param_changed,
+    PW_VERSION_STREAM_EVENTS,          .process = on_process,
+    .control_info = on_control_info,   .param_changed = on_param_changed,
     .state_changed = on_state_changed,
-    };
+};
+
+static void
+registry_event_global_remove(void * userdata, uint32_t id, uint32_t permissions,
+                             const char * type, uint32_t version,
+                             const struct spa_dict * props)
+{
+  printf("registry_event_global_remove\n");
+  // struct cubeb_stream * stm = userdata;
+  // struct cubeb * ctx = stm->context;
+  // ctx->total_devices--;
+}
+static const struct pw_registry_events registry_events = {
+    PW_VERSION_REGISTRY_EVENTS,
+    .global = registry_event_global,
+    .global_remove = registry_event_global_remove,
+};
+
+static void new_pipewire_props(cubeb_stream * stm, char const * name){
+  stm->props = pw_properties_new(
+      PW_KEY_MEDIA_TYPE, "Audio", PW_KEY_MEDIA_CATEGORY, "Playback",
+      PW_KEY_MEDIA_ROLE, NULL, PW_KEY_NODE_NAME, name, PW_KEY_NODE_DESCRIPTION,
+      name, PW_KEY_APP_NAME, name, PW_KEY_APP_ID, name, PW_KEY_APP_ICON_NAME,
+      name, PW_KEY_NODE_ALWAYS_PROCESS, "true", NULL);
+}
 
 int
 pipewire_init(cubeb ** context, char const * context_name)
@@ -227,6 +342,7 @@ pipewire_init(cubeb ** context, char const * context_name)
 
   pw_init(&ctx->mainloop, NULL);
 
+  ctx->total_devices = 0;
   ctx->context_name = context_name ? strdup(context_name) : NULL;
   ctx->mainloop = pw_thread_loop_new("ao-pipewire", NULL);
   pw_thread_loop_lock(ctx->mainloop);
@@ -240,23 +356,24 @@ pipewire_init(cubeb ** context, char const * context_name)
       pw_context_new(pw_thread_loop_get_loop(ctx->mainloop), NULL, 0);
   ctx->ops = &pipewire_ops;
   ctx->core = pw_context_connect(ctx->context, NULL, 0);
-  ctx->props = pw_properties_new(
-      PW_KEY_MEDIA_TYPE, "Audio", PW_KEY_MEDIA_CATEGORY, "Playback",
-      PW_KEY_MEDIA_ROLE, "Movie", PW_KEY_NODE_NAME, ctx->context_name,
-      PW_KEY_NODE_DESCRIPTION, ctx->context_name, PW_KEY_APP_NAME,
-      ctx->context_name, PW_KEY_APP_ID, ctx->context_name, PW_KEY_APP_ICON_NAME,
-      ctx->context_name, PW_KEY_NODE_ALWAYS_PROCESS, "true", NULL);
   if (!ctx->core) {
     return CUBEB_ERROR;
   }
-  // pw_main_loop_destroy(ctx->mainloop);
+
+  ctx->registry = pw_core_get_registry(ctx->core, PW_VERSION_REGISTRY,
+                                       0 /* user_data size */);
+
+  spa_zero(ctx->registry_listener);
+  pw_registry_add_listener(ctx->registry, &ctx->registry_listener,
+                           &registry_events, NULL);
   *context = ctx;
 
   printf("pipewire_init done\n");
   return CUBEB_OK;
 }
 
-static enum spa_audio_format spa_format(cubeb_sample_format format)
+static enum spa_audio_format
+spa_format(cubeb_sample_format format)
 {
   switch (format) {
   case CUBEB_SAMPLE_S16LE:
@@ -308,17 +425,9 @@ pipewire_stream_init(cubeb * context, cubeb_stream ** stream,
 
   cubeb * ctx = stm->context;
   // pw_thread_loop_lock(ctx->mainloop);
-
-  // printf("pw_stream_new: start\n");
-  // if(stm->stream != NULL) {
-  //   pw_stream_destroy(stm);
-  // }
-  stm->stream = pw_stream_new(ctx->core, ctx->context_name, ctx->props);
-  printf("stm->stream == NULL: %d\n", stm->stream == NULL);
-  printf("pw_stream_new: end");
-
-  
-  printf("pw_stream_set_param: start\n");
+  new_pipewire_props(stm, stream_name);
+  printf("pipewire_stream_init: pw_thread_loop_lock\n");
+  stm->stream = pw_stream_new(ctx->core, ctx->context_name, stm->props);
   stm->info.format = stm->spa_format = spa_format(output_stream_params->format);
   stm->info.rate = output_stream_params->rate;
   stm->info.channels = output_stream_params->channels;
@@ -373,7 +482,6 @@ pipewire_stream_start(cubeb_stream * stm)
   printf("pipewire_stream_start\n");
 
   pw_stream_set_active(stm->stream, true);
-
   LOG("Cubeb stream (%p) started successfully.", stm);
   return CUBEB_OK;
 }
@@ -384,9 +492,9 @@ pipewire_get_max_channel_count(cubeb * ctx, uint32_t * max_channels)
   (void)ctx;
   assert(ctx && max_channels);
   // if (!ctx->default_sink_info) return CUBEB_ERROR;
-
-  // *max_channels = ctx->default_sink_info->channel_map.channels;
   *max_channels = 2;
+  // *max_channels = ctx->default_sink_info->channel_map.channels;
+  // *max_channels = ctx->pw_cubeb_default_sink_info->max_channels;
   return CUBEB_OK;
 }
 
@@ -426,6 +534,13 @@ pipewire_destroy(cubeb * ctx)
   if (ctx->device_ids) {
     cubeb_strings_destroy(ctx->device_ids);
   }
+  if (ctx->registry) {
+    pw_proxy_destroy((struct pw_proxy *)ctx->registry);
+  }
+  // if (ctx->core){
+  //   pw_core_disconnect(ctx->core);
+  // }
+  pw_deinit();
   // if (ctx->libpipewire) {
   //   dlclose(ctx->libpipewire);
   // }
@@ -440,12 +555,12 @@ pipewire_get_preferred_sample_rate(cubeb * ctx, uint32_t * rate)
   assert(ctx && rate);
   (void)ctx;
 
-  if (!ctx->default_sink_info)
-    return CUBEB_ERROR;
+  // if (!ctx->default_sink_info)
+  //   return CUBEB_ERROR;
 
-  // pw_properties_get(props, PW_KEY_NODE_LATENCY) == NULL)
-  char * samplerate = pw_properties_get(ctx->props, PW_KEY_NODE_RATE);
-  printf("samplerate: %s\n", samplerate);
+  // // pw_properties_get(props, PW_KEY_NODE_LATENCY) == NULL)
+  // char * samplerate = pw_properties_get(ctx->props, PW_KEY_NODE_RATE);
+  // printf("samplerate: %s\n", samplerate);
   *rate = 48000;
 
   return CUBEB_OK;
@@ -477,19 +592,80 @@ pipewire_stream_get_position(cubeb_stream * stm, uint64_t * position)
 static int
 pipewire_stream_set_volume(cubeb_stream * stm, float volume)
 {
-  cubeb * ctx;
-
-  ctx = stm->context;
-  // float pipewire_volume = volume * 4.0f / 100.0f;
-  // // float pipewire_volume = 0;
-
-  // float values[2] = {pipewire_volume, pipewire_volume};
-  // pw_stream_set_control(stm->stream, SPA_PROP_channelVolumes,
-  //                                         2, values, 0);
-
-  // pw_stream_set_control(stm->stream, SPA_TYPE_Float, 65539,
-  // &pipewire_volume);
   stm->volume = volume;
+  return CUBEB_OK;
+}
+
+static int
+pipewire_stream_get_current_device(cubeb_stream * stm,
+                                   cubeb_device ** const device)
+{
+  *device = calloc(1, sizeof(cubeb_device));
+  if (*device == NULL)
+    return CUBEB_ERROR;
+
+  // if (stm->inp) {
+  //   const char * name = WRAP(pa_stream_get_device_name)(stm->input_stream);
+  //   (*device)->input_name = (name == NULL) ? NULL : strdup(name);
+  // }
+
+  // if (stm->output_stream) {
+  //   const char * name =
+  //   WRAP(pa_stream_get_device_name)(stm->output_stream);
+  //   (*device)->output_name = (name == NULL) ? NULL : strdup(name);
+  // }
+
+  return CUBEB_OK;
+}
+
+static int
+pipewire_stream_set_name(cubeb_stream * stm, char const * stream_name)
+{
+  if (!stm) {
+    return CUBEB_ERROR;
+  }
+
+  new_pipewire_props(stm, stream_name);
+  pw_stream_update_properties(stm->stream, stm->props);
+  return CUBEB_OK;
+}
+
+static int
+pipewire_device_collection_destroy(cubeb * ctx,
+                                cubeb_device_collection * collection)
+{
+  size_t n;
+
+  for (n = 0; n < collection->count; n++) {
+    free((void *)collection->device[n].friendly_name);
+    free((void *)collection->device[n].vendor_name);
+    free((void *)collection->device[n].group_id);
+  }
+
+  free(collection->device);
+  return CUBEB_OK;
+}
+
+static int
+pipewire_stream_get_latency(cubeb_stream * stm, uint32_t * latency)
+{
+  *latency = 0;
+  return CUBEB_OK;
+}
+
+static int
+pipewire_stream_get_latency_input(cubeb_stream * stm, uint32_t * latency){
+  *latency = 0;
+  return CUBEB_OK;
+}
+
+static int
+pipewire_stream_device_destroy(cubeb_stream * stream, cubeb_device * device)
+{
+  (void)stream;
+  free(device->input_name);
+  free(device->output_name);
+  free(device);
   return CUBEB_OK;
 }
 
@@ -499,19 +675,19 @@ static struct cubeb_ops const pipewire_ops = {
     .get_max_channel_count = pipewire_get_max_channel_count,
     .get_min_latency = pipewire_get_min_latency,
     .get_preferred_sample_rate = pipewire_get_preferred_sample_rate,
-    .enumerate_devices = NULL,
-    .device_collection_destroy = NULL,
+    .enumerate_devices = pipewire_enumerate_devices,
+    .device_collection_destroy = pipewire_device_collection_destroy,
     .destroy = pipewire_destroy,
     .stream_init = pipewire_stream_init,
     .stream_destroy = pipewire_stream_destroy,
     .stream_start = pipewire_stream_start,
     .stream_stop = pipewire_stream_stop,
     .stream_get_position = pipewire_stream_get_position,
-    .stream_get_latency = NULL,
-    .stream_get_input_latency = NULL,
+    .stream_get_latency = pipewire_stream_get_latency,
+    .stream_get_input_latency = pipewire_stream_get_latency_input,
     .stream_set_volume = pipewire_stream_set_volume,
-    .stream_set_name = NULL,
-    .stream_get_current_device = NULL,
-    .stream_device_destroy = NULL,
+    .stream_set_name = pipewire_stream_set_name,
+    .stream_get_current_device = pipewire_stream_get_current_device,
+    .stream_device_destroy = pipewire_stream_device_destroy,
     .stream_register_device_changed_callback = NULL,
     .register_device_collection_changed = NULL};
